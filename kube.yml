@@ -1,0 +1,191 @@
+# =============================================================================
+# k8s-lab2.yml — Kubernetes Manifests for Lab 2 Static Site
+#
+# Includes:
+#   - Namespace
+#   - Deployment  (3 replicas of the Nginx container)
+#   - Service     (ClusterIP + optional LoadBalancer)
+#   - ConfigMap   (inject index.html without rebuilding the image)
+#   - HorizontalPodAutoscaler (bonus: auto-scale on CPU)
+#
+# Apply:  kubectl apply -f k8s-lab2.yml
+# Delete: kubectl delete -f k8s-lab2.yml
+# Watch:  kubectl get all -n lab2
+# =============================================================================
+
+---
+# ── Namespace ─────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lab2
+  labels:
+    app.kubernetes.io/part-of: lab2-site
+
+---
+# ── ConfigMap: store index.html so it can be mounted into the pod ─────────────
+# Replace the placeholder HTML below with your actual generated index.html,
+# or run: kubectl create configmap lab2-html --from-file=index.html=./lab2_output/index.html -n lab2
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lab2-html
+  namespace: lab2
+  labels:
+    app: lab2-site
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>Lab 2 — Kubernetes</title>
+      <style>
+        body { background: linear-gradient(135deg,#0f2027,#203a43,#2c5364);
+               color:#e8f4f8; font-family:sans-serif; text-align:center;
+               padding:4rem 1rem; }
+        h1   { color:#7ecef4; font-size:2.5rem; }
+        p    { opacity:.8; margin-top:1rem; }
+      </style>
+    </head>
+    <body>
+      <h1>Lab 2 — Running on Kubernetes</h1>
+      <p>Replace this ConfigMap with your generated <code>index.html</code> from
+         <code>lab2_enhance.py</code>.</p>
+    </body>
+    </html>
+
+---
+# ── Deployment ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab2-site
+  namespace: lab2
+  labels:
+    app: lab2-site
+spec:
+  replicas: 3                         # 3 pods for availability
+  selector:
+    matchLabels:
+      app: lab2-site
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0               # zero-downtime rollouts
+  template:
+    metadata:
+      labels:
+        app: lab2-site
+    spec:
+      # ── Security: run as non-root ────────────────────────────────────────
+      securityContext:
+        runAsNonRoot: false           # Nginx needs root to bind 80; set true if using port 8080
+        fsGroup: 101                  # nginx group
+
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine   # swap with your built image: your-registry/lab2-site:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+          # ── Health probes ──────────────────────────────────────────────
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 10
+
+          # ── Mount the ConfigMap HTML ───────────────────────────────────
+          volumeMounts:
+            - name: html-volume
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+              readOnly: true
+
+      volumes:
+        - name: html-volume
+          configMap:
+            name: lab2-html
+
+---
+# ── Service: ClusterIP (internal) ─────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab2-site-clusterip
+  namespace: lab2
+  labels:
+    app: lab2-site
+spec:
+  selector:
+    app: lab2-site
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+
+---
+# ── Service: LoadBalancer (external — comment out if not needed) ──────────────
+# On AWS EKS this provisions an ELB automatically.
+# On Minikube run: minikube tunnel  then  kubectl get svc -n lab2
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab2-site-lb
+  namespace: lab2
+  labels:
+    app: lab2-site
+  annotations:
+    # AWS EKS: make it internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+spec:
+  selector:
+    app: lab2-site
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: LoadBalancer
+
+---
+# ── HorizontalPodAutoscaler (bonus) ──────────────────────────────────────────
+# Requires metrics-server installed in the cluster.
+# Install on EKS: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: lab2-site-hpa
+  namespace: lab2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: lab2-site
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
